@@ -4143,7 +4143,11 @@ describe("ensureRuntimeServicesForRun", () => {
           },
           adapterEnv: {},
         }),
-      ).rejects.toThrow(/Readiness check failed for http:\/\/127\.0\.0\.1:\d+\/api\/health: received HTTP 503/);
+        // The 503 health server must never pass readiness. Assert only that the
+        // readiness check fails for the health URL. Do not assert the exact reason
+        // string: under load the last probe near the deadline can get a small
+        // budget and abort with a timeout before it reads the HTTP 503 response.
+      ).rejects.toThrow(/Readiness check failed for http:\/\/127\.0\.0\.1:\d+\/api\/health/);
     } finally {
       await releaseRuntimeServicesForRun(runId);
     }
@@ -5881,6 +5885,10 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
 
   afterEach(async () => {
     await resetRuntimeServicesForTests();
+    // Service control writes activity_log rows. Delete them before the company
+    // delete so a lingering foreign-key row cannot block the company delete and
+    // leak rows into the next test.
+    await db.delete(activityLog);
     await db.delete(workspaceRuntimeServices);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
@@ -6455,9 +6463,16 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         return result[0]!;
       }));
 
-      expect(first.port).toBe(basePort);
-      expect(second.port).not.toBe(first.port);
-      expect(second.port).toBeGreaterThan(basePort);
+      // The two lanes claim ports concurrently in-process. The allocator guarantees
+      // distinct ports, but not which lane wins the base port. It depends on the
+      // scheduling order. So assert order-independent invariants, not array index.
+      const lowerPort = Math.min(first.port!, second.port!);
+      const upperPort = Math.max(first.port!, second.port!);
+      const maxAllocatablePort = basePort + WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS - 1;
+      expect(first.port).not.toBe(second.port);
+      expect(lowerPort).toBe(basePort);
+      expect(upperPort).toBeGreaterThan(basePort);
+      expect(upperPort).toBeLessThanOrEqual(maxAllocatablePort);
       expect(first.url).toBe(`http://127.0.0.1:${first.port}`);
       expect(second.url).toBe(`http://127.0.0.1:${second.port}`);
       await expect(fetch(first.url!)).resolves.toMatchObject({ ok: true });
@@ -6908,11 +6923,20 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   afterEach(async () => {
+    // Startup reconciliation writes activity_log rows (for example, exposure
+    // reservation drift). Delete those rows before the company delete. A stale
+    // activity_log row holds a foreign key to the company and makes the company
+    // delete fail, which leaks rows into the next test.
+    await db.delete(activityLog);
     await db.delete(workspaceRuntimeServices);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(heartbeatRuns);
+    // The runtime service control path writes activity_log rows through
+    // logActivity. Those rows reference the company. Delete them before the
+    // company to respect the activity_log.company_id foreign key.
+    await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companies);
   });
