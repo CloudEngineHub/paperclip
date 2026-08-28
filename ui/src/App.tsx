@@ -11,6 +11,7 @@ import { StatusCardsExperimentalGate } from "./components/StatusCardsExperimenta
 import { AppsExperimentalGate } from "./components/AppsExperimentalGate";
 import { CloudManagedPageGate } from "./components/CloudManagedPageGate";
 import { HiddenSettingsPageGate } from "./components/HiddenSettingsPageGate";
+import { IsolatedWorkspacesRouteGate } from "./components/IsolatedWorkspacesRouteGate";
 import { useHiddenSettings } from "./hooks/useHiddenSettings";
 import { Cases } from "./pages/Cases";
 import { CaseDetail } from "./pages/CaseDetail";
@@ -68,7 +69,6 @@ import { AppDetail } from "./pages/apps/AppDetail";
 import { AppNotConnected } from "./pages/apps/AppNotConnected";
 import { GatewaysList } from "./pages/apps/gateways/GatewaysList";
 import { GatewayDetail } from "./pages/apps/gateways/GatewayDetail";
-import { CompanyInvites } from "./pages/CompanyInvites";
 import { CompanySkills } from "./pages/CompanySkills";
 import { SkillStudio } from "./pages/SkillStudio";
 import { Secrets } from "./pages/Secrets";
@@ -76,7 +76,6 @@ import { CompanyImport } from "./pages/CompanyImport";
 import { DesignGuide } from "./pages/DesignGuide";
 import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
 import { InstanceAccess } from "./pages/InstanceAccess";
-import { InstanceSettings } from "./pages/InstanceSettings";
 import { ProfileSettings } from "./pages/ProfileSettings";
 import { PluginManager } from "./pages/PluginManager";
 import { PluginSettings } from "./pages/PluginSettings";
@@ -123,8 +122,13 @@ function boardRoutes() {
         <Route path="company/settings/members" element={<CompanyAccess />} />
         <Route path="company/settings/access" element={<CompanyAccessLegacyRoute />} />
       </Route>
+      {/* Invites moved into the Members page; the old URL redirects (and stays
+          gated so a hidden Invites surface never round-trips through it). */}
       <Route element={<HiddenSettingsPageGate pageKey="company.invites" />}>
-        <Route path="company/settings/invites" element={<CompanyInvites />} />
+        <Route
+          path="company/settings/invites"
+          element={<Navigate to="/company/settings/members?tab=invites" replace />}
+        />
       </Route>
       <Route element={<HiddenSettingsPageGate pageKey="company.export" />}>
         <Route
@@ -176,6 +180,7 @@ function boardRoutes() {
         <Route path="company/settings/instance/profile" element={<ProfileSettings />} />
       </Route>
       <Route path="company/settings/instance/general" element={<Navigate to="/company/settings" replace />} />
+      <Route path="company/settings/instance/heartbeats" element={<Navigate to="/company/settings" replace />} />
       <Route element={<HiddenSettingsPageGate pageKey="instance.environments" />}>
         <Route path="company/settings/instance/environments" element={<CompanyEnvironments />} />
         <Route path="company/settings/instance/environments/new" element={<CompanyEnvironments mode="create" />} />
@@ -183,9 +188,6 @@ function boardRoutes() {
       </Route>
       <Route element={<HiddenSettingsPageGate pageKey="instance.access" />}>
         <Route path="company/settings/instance/access" element={<InstanceAccess />} />
-      </Route>
-      <Route element={<HiddenSettingsPageGate pageKey="instance.heartbeats" />}>
-        <Route path="company/settings/instance/heartbeats" element={<InstanceSettings />} />
       </Route>
       <Route element={<HiddenSettingsPageGate pageKey="instance.experimental" />}>
         <Route path="company/settings/instance/experimental" element={<InstanceExperimentalSettings />} />
@@ -220,11 +222,15 @@ function boardRoutes() {
       <Route path="projects/:projectId/overview" element={<ProjectDetail />} />
       <Route path="projects/:projectId/issues" element={<ProjectDetail />} />
       <Route path="projects/:projectId/issues/:filter" element={<ProjectDetail />} />
-      <Route path="projects/:projectId/workspaces/:workspaceId" element={<ProjectWorkspaceDetail />} />
+      <Route element={<IsolatedWorkspacesRouteGate />}>
+        <Route path="projects/:projectId/workspaces/:workspaceId" element={<ProjectWorkspaceDetail />} />
+      </Route>
       <Route path="projects/:projectId/workspaces" element={<ProjectDetail />} />
       <Route path="projects/:projectId/configuration" element={<ProjectDetail />} />
       <Route path="projects/:projectId/budget" element={<ProjectDetail />} />
-      <Route path="workspaces" element={<Workspaces />} />
+      <Route element={<IsolatedWorkspacesRouteGate />}>
+        <Route path="workspaces" element={<Workspaces />} />
+      </Route>
       <Route path="issues" element={<Issues />} />
       <Route path="search" element={<Search />} />
       <Route path="issues/all" element={<Navigate to="/issues" replace />} />
@@ -290,12 +296,14 @@ function boardRoutes() {
       />
       <Route path="routines/:routineId" element={<RoutineDetail />} />
       <Route path="routines/:routineId/:section" element={<RoutineDetail />} />
-      <Route path="execution-workspaces/:workspaceId" element={<ExecutionWorkspaceDetail />} />
-      <Route path="execution-workspaces/:workspaceId/services" element={<ExecutionWorkspaceDetail />} />
-      <Route path="execution-workspaces/:workspaceId/configuration" element={<ExecutionWorkspaceDetail />} />
-      <Route path="execution-workspaces/:workspaceId/runtime-logs" element={<ExecutionWorkspaceDetail />} />
-      <Route path="execution-workspaces/:workspaceId/issues" element={<ExecutionWorkspaceDetail />} />
-      <Route path="execution-workspaces/:workspaceId/routines" element={<ExecutionWorkspaceDetail />} />
+      <Route element={<IsolatedWorkspacesRouteGate />}>
+        <Route path="execution-workspaces/:workspaceId" element={<ExecutionWorkspaceDetail />} />
+        <Route path="execution-workspaces/:workspaceId/services" element={<ExecutionWorkspaceDetail />} />
+        <Route path="execution-workspaces/:workspaceId/configuration" element={<ExecutionWorkspaceDetail />} />
+        <Route path="execution-workspaces/:workspaceId/runtime-logs" element={<ExecutionWorkspaceDetail />} />
+        <Route path="execution-workspaces/:workspaceId/issues" element={<ExecutionWorkspaceDetail />} />
+        <Route path="execution-workspaces/:workspaceId/routines" element={<ExecutionWorkspaceDetail />} />
+      </Route>
       <Route path="goals" element={<Goals />} />
       <Route path="goals/:goalId" element={<GoalDetail />} />
       <Route path="artifacts" element={<Artifacts />} />
@@ -463,13 +471,13 @@ export function OnboardingRoutePage() {
   const title = matchedCompany
     ? `Add another agent to ${matchedCompany.name}`
     : companies.length > 0
-      ? "Create another company"
-      : "Create your first company";
+      ? "Create another organization"
+      : "Create your first organization";
   const description = matchedCompany
-    ? "Run onboarding again to add an agent and a starter task for this company."
+    ? "Run onboarding again to add an agent and a starter task for this organization."
     : companies.length > 0
-      ? "Run onboarding again to create another company and seed its first agent."
-      : "Get started by creating a company and your first agent.";
+      ? "Run onboarding again to create another organization and seed its first agent."
+      : "Get started by creating an organization and your first agent.";
 
   return (
     <div className="mx-auto max-w-xl py-10">
@@ -588,10 +596,10 @@ function NoCompaniesStartPage() {
     <div className="mx-auto max-w-xl py-10">
       <div className="rounded-lg border border-border bg-card p-6">
         <h1 className="text-xl font-semibold">
-          {t("app.noCompanies.title", { defaultValue: "Create your first company" })}
+          {t("app.noCompanies.title", { defaultValue: "Create your first organization" })}
         </h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          {t("app.noCompanies.description", { defaultValue: "Get started by creating a company." })}
+          {t("app.noCompanies.description", { defaultValue: "Get started by creating an organization." })}
         </p>
         <div className="mt-4">
           {/* Same as the onboarding route: no Cloud origin means nowhere to
@@ -611,7 +619,7 @@ function NoCompaniesStartPage() {
                   : openOnboarding()
               }
             >
-              {t("app.noCompanies.newCompany", { defaultValue: "New Company" })}
+              {t("app.noCompanies.newCompany", { defaultValue: "New Organization" })}
             </Button>
           )}
         </div>
