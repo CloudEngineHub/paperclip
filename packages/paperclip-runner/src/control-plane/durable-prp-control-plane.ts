@@ -380,9 +380,13 @@ function isStoredCoreState(
         commandTypes.has(command.type) &&
         typeof command.issuedAt === "string" &&
         isRecord(command.payload) &&
-        ["pending", "completed", "failed", "rejected"].includes(
-          String(command.status),
-        ) &&
+        [
+          "pending",
+          "completed",
+          "failed",
+          "rejected",
+          "indeterminate",
+        ].includes(String(command.status)) &&
         (command.result === null || isRecord(command.result)),
     )
   ) {
@@ -741,34 +745,35 @@ export interface DurablePrpControlPlaneStore {
   readonly state: StoredCoreState;
 }
 
-class PrpWebSocketConnection {
+class RawWebSocketWireConnection implements PrpWireConnection {
   readonly socket: Duplex;
-  pendingChallenge: PendingChallenge | null = null;
-  secureChannel: SecureChannel | null = null;
-  lease: ConnectionLeaseRecord | null = null;
-  connectionId: string | null = null;
   #buffer = Buffer.alloc(0);
   #closed = false;
-  #onText: (text: string) => void | Promise<void>;
-  #onClose: () => void;
-  #processing = Promise.resolve();
+  #onJson: (value: unknown) => void = () => undefined;
+  #onClose: (reason: TransportCloseReason) => void = () => undefined;
 
-  constructor(
-    socket: Duplex,
-    onText: (text: string) => void | Promise<void>,
-    onClose: () => void,
-  ) {
+  constructor(socket: Duplex) {
     this.socket = socket;
-    this.#onText = onText;
-    this.#onClose = onClose;
     socket.on("data", (chunk: Buffer) => this.#consume(chunk));
     socket.on("close", () => {
       if (!this.#closed) {
         this.#closed = true;
-        this.#onClose();
+        this.#onClose({ message: "socket_closed" });
       }
     });
-    socket.on("error", () => this.close());
+    socket.on("error", (error) => {
+      if (this.#closed) return;
+      this.#closed = true;
+      this.#onClose({ message: "socket_error", error });
+    });
+  }
+
+  onJson(listener: (value: unknown) => void): void {
+    this.#onJson = listener;
+  }
+
+  onClose(listener: (reason: TransportCloseReason) => void): void {
+    this.#onClose = listener;
   }
 
   acceptInitialData(data: Buffer<ArrayBufferLike>): void {
@@ -776,11 +781,7 @@ class PrpWebSocketConnection {
   }
 
   sendJson(value: unknown): void {
-    const wire =
-      this.secureChannel === null
-        ? value
-        : encryptSecureJson(this.secureChannel, value);
-    this.sendText(JSON.stringify(wire));
+    this.sendText(JSON.stringify(value));
   }
 
   sendText(text: string): void {
@@ -803,13 +804,13 @@ class PrpWebSocketConnection {
     this.socket.write(Buffer.concat([Buffer.from(header), payload]));
   }
 
-  close(): void {
+  close(_code?: number): void {
     if (this.#closed) {
       return;
     }
     this.#closed = true;
     this.socket.destroy();
-    this.#onClose();
+    this.#onClose({ message: "local_close" });
   }
 
   #consume(chunk: Buffer): void {
@@ -850,10 +851,14 @@ class PrpWebSocketConnection {
         payload[index] = payload[index]! ^ mask[index % 4]!;
       }
       if (opcode === 0x1) {
-        const text = payload.toString("utf8");
-        this.#processing = this.#processing
-          .then(() => this.#onText(text))
-          .catch(() => this.close());
+        try {
+          this.#onJson(JSON.parse(payload.toString("utf8")) as unknown);
+        } catch (error) {
+          this.#closed = true;
+          this.socket.destroy();
+          this.#onClose({ message: "invalid_json", error });
+          return;
+        }
       } else if (opcode === 0x8) {
         this.close();
         return;
@@ -874,6 +879,49 @@ class PrpWebSocketConnection {
   }
 }
 
+class AuthorityConnection {
+  pendingChallenge: PendingChallenge | null = null;
+  secureChannel: SecureChannel | null = null;
+  lease: ConnectionLeaseRecord | null = null;
+  connectionId: string | null = null;
+  readonly wire: PrpWireConnection;
+  #closed = false;
+  #onClose: () => void;
+
+  constructor(input: {
+    wire: PrpWireConnection;
+    onJson: (value: unknown) => void;
+    onClose: () => void;
+  }) {
+    this.wire = input.wire;
+    this.#onClose = input.onClose;
+    this.wire.onJson(input.onJson);
+    this.wire.onClose(() => this.#markClosed());
+  }
+
+  sendJson(value: unknown): void {
+    if (this.#closed) return;
+    this.wire.sendJson(
+      this.secureChannel === null
+        ? value
+        : encryptSecureJson(this.secureChannel, value),
+    );
+  }
+
+  close(code?: number): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.wire.close(code);
+    this.#onClose();
+  }
+
+  #markClosed(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#onClose();
+  }
+}
+
 /** Authenticated, replay-safe PRP transport authority. Business operations are caller supplied. */
 export class DurablePrpControlPlane {
   readonly #identity: DurableRecoveryIdentity;
@@ -881,7 +929,7 @@ export class DurablePrpControlPlane {
   #expectedRunnerVersion: string;
   #expectedRunnerDigest: string;
   #server: Server | null = null;
-  #connections = new Set<PrpWebSocketConnection>();
+  #connections = new Set<AuthorityConnection>();
   #pendingSemanticCalls = new Set<string>();
   #port: number | null = null;
   #onSemanticToolInput?: DurablePrpControlPlaneOptions["onSemanticToolInput"];
@@ -1110,23 +1158,36 @@ export class DurablePrpControlPlane {
         "\r\n",
       ].join("\r\n"),
     );
-    let connection!: PrpWebSocketConnection;
-    connection = new PrpWebSocketConnection(
-      socket,
-      (text): Promise<void> => this.#handleText(connection, text),
-      () => this.#connections.delete(connection),
-    );
-    this.#connections.add(connection);
-    connection.acceptInitialData(head);
+    const wire = new RawWebSocketWireConnection(socket);
+    this.attachWireConnection(wire);
+    wire.acceptInitialData(head);
   }
 
-  async #handleText(
-    connection: PrpWebSocketConnection,
-    text: string,
+  /** Attach either an accepted inbound WebSocket or a Paperclip-opened peer. */
+  attachWireConnection(wire: PrpWireConnection): PrpWireAttachment {
+    let connection!: AuthorityConnection;
+    let processing = Promise.resolve();
+    connection = new AuthorityConnection({
+      wire,
+      onJson: (value) => {
+        processing = processing
+          .then(() => this.#handleJson(connection, value))
+          .catch(() => connection.close());
+      },
+      onClose: () => this.#connections.delete(connection),
+    });
+    this.#connections.add(connection);
+    return {
+      isAuthenticated: () => connection.secureChannel !== null,
+    };
+  }
+
+  async #handleJson(
+    connection: AuthorityConnection,
+    wire: unknown,
   ): Promise<void> {
     let envelope: Record<string, unknown>;
     try {
-      const wire = JSON.parse(text) as unknown;
       envelope =
         connection.secureChannel === null
           ? (wire as Record<string, unknown>)
@@ -1306,7 +1367,7 @@ export class DurablePrpControlPlane {
   }
 
   #authHello(
-    connection: PrpWebSocketConnection,
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): void {
     if (connection.pendingChallenge !== null) {
@@ -1371,7 +1432,7 @@ export class DurablePrpControlPlane {
   }
 
   #authResponse(
-    connection: PrpWebSocketConnection,
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): void {
     const pending = connection.pendingChallenge;
@@ -1451,7 +1512,7 @@ export class DurablePrpControlPlane {
   }
 
   #welcome(
-    connection: PrpWebSocketConnection,
+    connection: AuthorityConnection,
     leaseToken: string | null,
   ): void {
     const lease = connection.lease;
@@ -1522,7 +1583,7 @@ export class DurablePrpControlPlane {
   }
 
   #controlEnvelope(
-    connection: PrpWebSocketConnection,
+    connection: AuthorityConnection,
     envelopeId: string,
     kind: string,
     payload: Record<string, unknown>,
@@ -1550,7 +1611,7 @@ export class DurablePrpControlPlane {
     };
   }
 
-  #sendNextCommand(connection: PrpWebSocketConnection): void {
+  #sendNextCommand(connection: AuthorityConnection): void {
     const [command] = this.#nextPendingCommand();
     if (command === undefined) return;
     this.#store.state.commandDeliveryCounts[command.commandId] =
@@ -1567,7 +1628,7 @@ export class DurablePrpControlPlane {
   }
 
   #commandResult(
-    connection: PrpWebSocketConnection,
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): void {
     const result = envelope.payload as Record<string, unknown> | undefined;
@@ -1584,10 +1645,16 @@ export class DurablePrpControlPlane {
       return;
     }
     const status = result.status;
+    // `indeterminate` is terminal too: a runner that crashed between journaling
+    // a command and confirming its effect reports it on recovery and will not
+    // execute it again. Rejecting it closes the connection, and since the
+    // runner replays the same result on every reconnect, the session never
+    // recovers.
     if (
       status !== "completed" &&
       status !== "failed" &&
-      status !== "rejected"
+      status !== "rejected" &&
+      status !== "indeterminate"
     ) {
       connection.close();
       return;
@@ -1609,7 +1676,7 @@ export class DurablePrpControlPlane {
   }
 
   async #event(
-    connection: PrpWebSocketConnection,
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): Promise<void> {
     const validated = validatePrpEvent(envelope.payload);
@@ -1819,6 +1886,7 @@ const runnerExplicitProviderEnvironmentKeys = [
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "PAPERCLIP_OPENCODE_COMMAND",
+  "PAPERCLIP_OPENCODE_PERMISSION_MODE",
   "PAPERCLIP_OPENCODE_RUNTIME_DIR",
   "PAPERCLIP_RUNNER_INSTANCE_ID",
   "PAPERCLIP_RUN_ID",
