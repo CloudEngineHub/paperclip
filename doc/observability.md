@@ -373,6 +373,15 @@ context the other kept default integrations add: the host name, the
 runtime version, and the dependency list. See "Default capture set"
 below.
 
+### Run failure context
+
+Terminal run failures also carry the run and task IDs, adapter, error code,
+run status, and redacted error message. Their fingerprint is the error code
+and adapter. These fields are passed directly to that event's capture call.
+They do not change the ambient Sentry scope, whose isolation is unavailable
+without an OpenTelemetry context manager. Later, unrelated exceptions must
+not inherit a previous run's identity or fingerprint.
+
 ### Browser data
 
 The browser sends no page URL, no referrer, no user agent, and no
@@ -483,6 +492,14 @@ These fields contain build identifiers; they add no tenant or user identity.
   refreshing its catalog returns 422 with `oauth_challenge` and the existing
   setup/reconnect links. Other upstream failures still return 502 and are
   reported, including an unexplained upstream HTTP 400.
+- Expired OAuth credentials without a refresh token, or a rejected refresh token
+  that requires reauthorization. Discovery and health checks return 422 with
+  `oauth_refresh_missing` or `oauth_reauthorization_required` and the existing
+  reconnect instructions. Unexpected refresh failures remain reportable.
+- Slack's explicit response that its app has not enabled MCP access. Discovery
+  and health checks return 422 with `slack_mcp_access_disabled` and setup
+  instructions. This requires Slack's exact MCP endpoint and known error;
+  other HTTP 400 responses remain reportable.
 - A performance trace and a profile, because `tracesSampleRate` is 0.
 
 ### Operator responsibilities

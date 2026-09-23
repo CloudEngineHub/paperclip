@@ -186,6 +186,7 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { isSlackMcpAccessDisabledResponse } from "./slack-mcp-error.js";
 import {
   initializeMcpHttpSession,
   McpHttpInitializationError,
@@ -224,6 +225,7 @@ import {
   narrowestScopeBindings,
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
+import { assertGoogleChatToolArgumentsSupported, googleChatToolDescription, googleChatToolInputSchema } from "./google-chat-tool-policy.js";
 import {
   recordToolRuntimeAuditWriteFailure,
   TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC,
@@ -1281,7 +1283,9 @@ export function projectConnectionMethodToolInputSchema(
 export function projectedConnectionToolArguments(
   connection: typeof toolConnections.$inferSelect,
   parameters: unknown,
+  toolName: string,
 ): Record<string, unknown> {
+  assertGoogleChatToolArgumentsSupported(connection, toolName, parameters);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1299,7 +1303,9 @@ export function projectedConnectionToolArguments(
 export function projectedConnectionToolInputSchema(
   connection: typeof toolConnections.$inferSelect,
   inputSchema: Record<string, unknown>,
+  toolName: string,
 ): Record<string, unknown> {
+  inputSchema = googleChatToolInputSchema(connection, toolName, inputSchema);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1691,7 +1697,9 @@ function toCatalogEntryForConnection(
     inputSchema: projectedConnectionToolInputSchema(
       connection,
       rawCatalogEntry.inputSchema ?? {},
+      row.toolName,
     ),
+    description: googleChatToolDescription(connection, row.toolName, rawCatalogEntry.description),
   };
   if (
     connection.transport === "local_stdio" &&
@@ -2804,6 +2812,9 @@ function healthFailureHttpStatus(failure: {
 }): number {
   if (failure.status === "missing_secret") return 422;
   if (failure.code === "oauth_challenge") return 422;
+  if (failure.code === "oauth_refresh_missing") return 422;
+  if (failure.code === "oauth_reauthorization_required") return 422;
+  if (failure.code === "slack_mcp_access_disabled") return 422;
   if (failure.code === "user_authorization_required") return 422;
   if (failure.code === "composio_broker_retired") return 422;
   if (failure.code === "tool_connection_transport_unsupported") return 422;
@@ -2825,6 +2836,9 @@ function sanitizeHttpFailure(error: unknown): {
 } {
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
+    if (code === "slack_mcp_access_disabled") {
+      return { status: "error", message: error.message, code };
+    }
     if (code === "user_authorization_required") {
       return { status: "error", message: error.message, code };
     }
@@ -6859,6 +6873,12 @@ export function toolAccessService(
       }
     }
     if (!response.ok) {
+      if (await isSlackMcpAccessDisabledResponse(endpoint, response)) {
+        throw unprocessable(
+          "Slack MCP access is disabled for this app. Ask the Slack app owner to enable MCP access, then refresh this connection.",
+          { code: "slack_mcp_access_disabled", setupUrl: connectionSetupUrl(connection) },
+        );
+      }
       const authenticate = response.headers.get("www-authenticate") ?? "";
       if (
         response.status === 401 &&
@@ -16662,6 +16682,8 @@ export function toolAccessService(
 
     reconnectGalleryApp,
 
+    storeConnectorOAuthSecret: createOrRotateOAuthSecret,
+    resolveConnectorOAuthGrantSecret: resolveOAuthGrantSecret,
     startOAuth,
 
     startAuthorizationForAgent: async (input: {
