@@ -289,6 +289,7 @@ import {
   resolveRemoteRunnerTransportMode,
   renewNativeSessionExecutionLease,
   runtimeInputLifecycleMetric,
+  firstMeaningfulAgentEventKind,
   runtimeQuestionFallbackFromEvent,
   resolveNativeRuntimeRequest,
   resolveNativeHarnessPersistenceProfile,
@@ -306,6 +307,59 @@ beforeEach(() => {
   state.resolveRunnerBinary.mockReset().mockReturnValue("/tmp/paperclip-runnerd");
   state.resolveCurrentWakeCommentsBinding.mockReset().mockResolvedValue(null);
   state.assertCurrentWakeCommentsRead.mockReset().mockResolvedValue(undefined);
+});
+
+describe("first meaningful native agent event", () => {
+  const event = (eventType: string, payload: Record<string, unknown>) =>
+    ({ eventType, payload }) as PrpEvent;
+
+  it("accepts nonempty assistant and reasoning deltas", () => {
+    expect(
+      firstMeaningfulAgentEventKind(
+        event("item.delta", { kind: "agentMessage", text: "first token" }),
+      ),
+    ).toBe("agentMessage");
+    expect(
+      firstMeaningfulAgentEventKind(
+        event("item.delta", { kind: "reasoning", delta: "thinking" }),
+      ),
+    ).toBe("reasoning");
+  });
+
+  it("accepts real tool starts and preserves qualified item events", () => {
+    expect(
+      firstMeaningfulAgentEventKind(
+        event("tool.execution.started", {
+          executionId: "tool-1",
+          name: "Terminal",
+        }),
+      ),
+    ).toBe("toolCall");
+    expect(
+      firstMeaningfulAgentEventKind(
+        event("item.started", { kind: "dynamicToolCall" }),
+      ),
+    ).toBe("dynamicToolCall");
+    expect(
+      firstMeaningfulAgentEventKind(
+        event("item.completed", { kind: "agentMessage" }),
+      ),
+    ).toBe("agentMessage");
+  });
+
+  it("counts a generic tool announcement without a display name", () => {
+    expect(firstMeaningfulAgentEventKind(event("tool.execution.started", { executionId: "tool-1", name: null }))).toBe("toolCall");
+  });
+
+  it("ignores empty deltas and usage, status, or metadata events", () => {
+    for (const candidate of [
+      event("item.delta", { kind: "agentMessage", text: " " }),
+      event("item.delta", { kind: "reasoning", delta: "" }),
+      event("item.delta", { kind: "usage", text: "tokens" }),
+      event("turn.started", { kind: "agentMessage", text: "message" }),
+      event("tool.execution.started", { name: "Terminal" }),
+    ]) expect(firstMeaningfulAgentEventKind(candidate)).toBeNull();
+  });
 });
 
 describe("remote controller restart adoption", () => {
@@ -9982,6 +10036,7 @@ describe("runnerd provider runtime wiring", () => {
         .mockImplementation((binding: Record<string, unknown>) =>
           Promise.resolve({ runId: binding.runId }),
         );
+      const tracedRuns: string[] = [];
       let firstScopedRoot: string | undefined;
       for (const candidate of [
         first,
@@ -10015,6 +10070,13 @@ describe("runnerd provider runtime wiring", () => {
           db: candidateDb,
           execution: candidate,
           runnerInstanceId: `runner-${candidate.binding.runId}`,
+          toolTrace: {
+            observe() {},
+            async execute(_call, work) {
+              tracedRuns.push(candidate.binding.runId);
+              return await work();
+            },
+          },
         });
         state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
         if (candidate === first) {
@@ -10067,6 +10129,7 @@ describe("runnerd provider runtime wiring", () => {
       await expect(
         continuationOptions.dynamicToolHandler!({}),
       ).resolves.toEqual({ runId: continuation.binding.runId });
+      expect(tracedRuns).toEqual([continuation.binding.runId, continuation.binding.runId]);
     } finally {
       if (previousStateDirectory === undefined) {
         delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
@@ -10332,27 +10395,35 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
-  it.each(["current", "stale", "missing", "retained", "retained-mismatch", "retained-error", "retained-timeout", "retained-explicit"])("uses shared Codex and the server-owned replacement artifact (image=%s)", async (image) => {
+  it.each([
+    ...["current", "preinstalled-exact", "preinstalled-mismatch", "preinstalled-error", "preinstalled-timeout", "stale", "missing", "retained", "retained-mismatch", "retained-error", "retained-timeout", "retained-explicit"]
+      .map((image) => ({ image, version: "0.156.0", compatible: true })),
+    ...["0.149.0", "0.149.1", "0.153.4", "0.156.1"]
+      .map((version) => ({ image: "current", version, compatible: true })),
+    ...["0.148.9", "0.157.0", "1.0.0", "0.156.0-alpha.1", "unknown"]
+      .map((version) => ({ image: "current", version, compatible: false })),
+  ])("uses shared Codex and the server-owned replacement artifact (image=$image, Codex=$version)", async ({ image, version, compatible }) => {
     const retained = image.startsWith("retained");
     const exactRetained = image === "retained" || image === "retained-explicit";
-    const needsReplacement = image !== "current" && !exactRetained;
+    const needsReplacement = image !== "current" && image !== "preinstalled-exact" && !exactRetained;
     // The mocked remote executes metadata probes; artifact staging only needs bytes.
     // Keep this regression independent of a locally compiled Rust runner binary.
     const controllerArtifact = join(isolatedStateDirectory, "paperclip-runnerd");
-    if (needsReplacement || retained) {
+    if (needsReplacement || retained || image === "preinstalled-exact") {
       await writeFile(controllerArtifact, "fixture runner artifact");
       state.resolveRunnerBinary.mockReturnValueOnce(controllerArtifact);
     }
+    const onLog = vi.fn(async () => undefined);
     const syncIn = vi.fn(async () => undefined);
     const remoteExecute = vi.fn(
       async (command: { command: string; args?: string[] }) => {
         let stdout = "";
         const script = command.args?.[1] ?? "";
         if (script.includes('sha256sum "$1"')) {
-          if (image === "retained-error") throw new Error("checksum unavailable");
+          if (image.endsWith("-error")) throw new Error("checksum unavailable");
           return {
-            exitCode: 0, signal: null, timedOut: image === "retained-timeout", stderr: "",
-            stdout: `${createHash("sha256").update(image === "retained-mismatch" ? "stale artifact" : "fixture runner artifact").digest("hex")}  ${command.args?.[3]}\n`,
+            exitCode: 0, signal: null, timedOut: image.endsWith("-timeout"), stderr: "",
+            stdout: `${createHash("sha256").update(image.endsWith("-mismatch") ? "stale artifact" : "fixture runner artifact").digest("hex")}  ${command.args?.[3]}\n`,
           };
         } else if (command.args?.[0] === "--build-metadata") {
           stdout = JSON.stringify({
@@ -10373,7 +10444,7 @@ describe("runnerd provider runtime wiring", () => {
           ) {
             throw new Error("reached-preinstalled-codex-verification");
           }
-          stdout = "codex-cli 0.156.0";
+          stdout = `codex-cli ${version}`;
         } else if (script === "uname -s; uname -m") {
           stdout = `${process.platform === "darwin" ? "Darwin" : "Linux"}\n${process.arch === "arm64" ? "arm64" : "x86_64"}\n`;
         } else if (script.includes("command -v paperclip-runnerd")) {
@@ -10401,6 +10472,7 @@ describe("runnerd provider runtime wiring", () => {
       db: leaseDb(execution),
       execution,
       runnerInstanceId: "runner-image-runtime",
+      onLog,
       ...(image === "retained-explicit" ? { runnerRemoteBinaryPath: controllerArtifact } : {}),
       runnerIngressAuthorized: true,
       runnerExecutionTarget: {
@@ -10422,8 +10494,17 @@ describe("runnerd provider runtime wiring", () => {
       controlPlaneRegistration: (authority: unknown) => Promise<unknown>;
     };
     await expect(transport.controlPlaneRegistration({})).rejects.toThrow(
-      "reached-preinstalled-codex-verification",
+      compatible ? "reached-preinstalled-codex-verification" : "runner_remote_provider_artifact_incompatible: supported Codex versions >=0.149.0 <0.157.0",
     );
+    if (!compatible) {
+      expect(syncIn).not.toHaveBeenCalled();
+      expect(remoteExecute.mock.calls.some(([call]) => call.command === "npm" || call.args?.[1]?.includes("paperclip_codex_launcher_tmp"))).toBe(false);
+      expect(onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("using compatible Codex"));
+      return;
+    }
+    if (version !== "0.156.0") {
+      expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(`using compatible Codex ${version}`));
+    }
     if (needsReplacement) {
       expect(transport.runnerBinary).toBe(controllerArtifact);
       expect(syncIn).toHaveBeenCalledTimes(1);

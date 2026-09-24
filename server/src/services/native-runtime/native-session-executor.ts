@@ -1,3 +1,9 @@
+import {
+  isSupportedRemoteCodexVersion,
+  parseCodexCliVersion,
+  REMOTE_CODEX_SUPPORTED_RANGE,
+} from "./codex-runtime-compatibility.js";
+import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
 import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-github-access.js";
 import { resolveGitHubOperationCredentials } from "../github-operation-credentials.js";
 import { bindManagedNativeCredentialTurn, completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
@@ -1410,7 +1416,7 @@ class SessionToolAuthorityEpoch {
   #authority: PaperclipRunnerToolAuthority;
   #revoked = false;
 
-  constructor(runId: string, authority: PaperclipRunnerToolAuthority) {
+  constructor(runId: string, authority: PaperclipRunnerToolAuthority, private readonly toolTrace?: NativeToolTrace) {
     this.runId = runId;
     this.#authority = authority;
   }
@@ -1432,7 +1438,9 @@ class SessionToolAuthorityEpoch {
 
   async execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]) {
     this.#assertCurrent();
-    return await this.#authority.execute(call);
+    return this.toolTrace
+      ? await this.toolTrace.execute(call, () => this.#authority.execute(call))
+      : await this.#authority.execute(call);
   }
 }
 
@@ -6131,6 +6139,42 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+type FirstAgentEventKind =
+  | "reasoning"
+  | "agentMessage"
+  | "toolCall"
+  | "dynamicToolCall";
+
+/** Returns the first provider activity worth measuring after turn.started. */
+export function firstMeaningfulAgentEventKind(
+  event: Pick<PrpEvent, "eventType" | "payload">,
+): FirstAgentEventKind | null {
+  const payload = record(event.payload);
+  if (event.eventType === "tool.execution.started") {
+    return typeof payload.executionId === "string" &&
+      payload.executionId.trim()
+      ? "toolCall"
+      : null;
+  }
+  if (
+    event.eventType !== "item.started" &&
+    event.eventType !== "item.delta" &&
+    event.eventType !== "item.completed"
+  ) return null;
+  const kind = payload.kind;
+  if (
+    kind !== "reasoning" &&
+    kind !== "agentMessage" &&
+    kind !== "toolCall" &&
+    kind !== "dynamicToolCall"
+  ) return null;
+  if (event.eventType !== "item.delta") return kind;
+  const text = [payload.text, payload.delta, payload.content].find(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+  return text ? kind : null;
+}
+
 export type NativeSessionSteeringState = {
   disposition: "available" | "unsupported" | "temporarily_unavailable";
   activeTurnId: string | null;
@@ -7254,6 +7298,7 @@ async function executePaperclipNativeSessionWithinScope(
     startedAtMs: preparationStarts.runStartedAtMs,
     onEvent: input.onEvent,
   });
+  const toolTrace = createNativeToolTrace(trace);
   const taskPrepareScope = trace.start("task.prepare", {
     parentName: "task.run",
     startedAtMs: preparationStarts.preparationStartedAtMs,
@@ -7643,6 +7688,7 @@ async function executePaperclipNativeSessionWithinScope(
     },
     {
       onCommittedEvent: async (event) => {
+        await toolTrace.observe(event);
         if (event.eventType === "item.completed" &&
             record(event.payload).kind === "agentMessage" &&
             record(event.payload).channel === "final") {
@@ -7722,23 +7768,9 @@ async function executePaperclipNativeSessionWithinScope(
             endedAtMs: milestoneAtMs,
           });
         }
-        if (
-          !firstAgentEventRecorded &&
-          turnStartedAtMs !== null &&
-          (event.eventType === "item.started" ||
-            event.eventType === "item.completed")
-        ) {
-          const payload = record(event.payload);
-          const kind =
-            typeof payload.kind === "string" ? payload.kind : "unknown";
-          if (
-            [
-              "reasoning",
-              "agentMessage",
-              "toolCall",
-              "dynamicToolCall",
-            ].includes(kind)
-          ) {
+        if (!firstAgentEventRecorded && turnStartedAtMs !== null) {
+          const kind = firstMeaningfulAgentEventKind(event);
+          if (kind) {
             firstAgentEventRecorded = true;
             await trace.record({
               name: "provider.time_to_first_agent_event",
@@ -8108,6 +8140,7 @@ async function executePaperclipNativeSessionWithinScope(
             runnerInstanceId: effectiveRunnerInstanceId,
             durableEnvironmentLeaseId: durableRunnerBinding?.environmentLeaseId,
             trace,
+            toolTrace,
           })
         : null;
     const remoteCleanupLease = input.runnerExecutionTarget?.kind === "remote" &&
@@ -10332,6 +10365,7 @@ export async function createRunnerdBackend(input: {
   runnerRemoteCodexNpmSpec?: string | null;
   runnerRemoteProviderPackPath?: string | null;
   trace?: NativeRunTrace;
+  toolTrace?: NativeToolTrace;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   stopTaskForReassignment?: (target: { companyId: string; issueId: string; agentId: string; runId: string | null }) => Promise<void>;
   enqueueWakeup?: (
@@ -10455,6 +10489,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const authorityEpoch = new SessionToolAuthorityEpoch(
     input.execution.binding.runId,
     authority,
+    input.toolTrace,
   );
   let dynamicTools: Awaited<
     ReturnType<SessionToolAuthorityEpoch["definitions"]>
@@ -10636,6 +10671,7 @@ async function createRunnerdBackendWithinSessionClaim(
     assertRemoteRunnerBuildMetadata(metadata, requiredMode);
   };
 
+  const reportedCodexVersions = new Set<string>();
   const verifyRemoteCodex = async (executable = remoteCodexBinary) => {
     if (!remoteTarget || !remoteCommandRunner || !executable) return;
     const versionResult = await remoteCommandRunner.execute({
@@ -10649,10 +10685,17 @@ async function createRunnerdBackendWithinSessionClaim(
       throw new Error("runner_remote_codex_artifact_verification_failed");
     }
     const versionOutput = `${versionResult.stdout}\n${versionResult.stderr}`;
-    const version = versionOutput.match(/\bcodex-cli\s+(\d+\.\d+\.\d+)\b/)?.[1];
-    if (version !== REMOTE_PROVIDER_PACK_PINS.codex) {
+    const version = parseCodexCliVersion(versionOutput);
+    if (!version || !isSupportedRemoteCodexVersion(version)) {
       throw new Error(
-        `runner_remote_provider_artifact_incompatible: expected Codex ${REMOTE_PROVIDER_PACK_PINS.codex}, received ${version ?? "an unrecognized version"}`,
+        `runner_remote_provider_artifact_incompatible: supported Codex versions ${REMOTE_CODEX_SUPPORTED_RANGE}, received ${version ?? "an unrecognized or prerelease version"}; install a supported stable Codex release or configure PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC=@openai/codex@${REMOTE_PROVIDER_PACK_PINS.codex}`,
+      );
+    }
+    if (version !== REMOTE_PROVIDER_PACK_PINS.codex && !reportedCodexVersions.has(version)) {
+      reportedCodexVersions.add(version);
+      await input.onLog?.(
+        "stderr",
+        `[paperclip-runner] using compatible Codex ${version} (supported ${REMOTE_CODEX_SUPPORTED_RANGE}; install pin ${REMOTE_PROVIDER_PACK_PINS.codex})\n`,
       );
     }
   };
@@ -10809,9 +10852,33 @@ async function createRunnerdBackendWithinSessionClaim(
       remotePrepared = true;
       return;
     }
-    // A resumed sandbox may already contain the exact controller-owned binary.
-    // Do not upload it every turn, but never treat compatible metadata alone as
-    // proof of artifact identity (especially for an explicit operator override).
+    // Compatibility metadata does not prove artifact identity. Reuse only the
+    // exact controller-owned bytes when the controller artifact is available.
+    const matchesControllerRunnerArtifact = async (executable: string): Promise<boolean> => {
+      const expected = createHash("sha256")
+        .update(readFileSync(controllerRunnerBinary))
+        .digest("hex");
+      try {
+        const probe = await remoteCommandRunner.execute({
+          command: "sh",
+          args: [
+            "-c",
+            'test -x "$1" || exit 1; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi',
+            "paperclip-runner-artifact",
+            executable,
+          ],
+          cwd: remoteTarget.remoteCwd,
+          bypassSession: true,
+          timeoutMs: 10_000,
+        });
+        return probe.exitCode === 0 && !probe.timedOut &&
+          /^[a-f0-9]{64}\s/.test(probe.stdout) &&
+          probe.stdout.trim().split(/\s+/)[0] === expected;
+      } catch {
+        // An unavailable checksum uses the verified staging path.
+        return false;
+      }
+    };
     let runnerArtifactPrepared = false;
     if (
       sandboxLeaseAcquisition?.outcome === "resumed" &&
@@ -10820,32 +10887,7 @@ async function createRunnerdBackendWithinSessionClaim(
       runnerArtifactPrepared = await measureNativeRunnerSpan(
         input.trace,
         "runner.artifact.verify_retained",
-        async () => {
-          const expected = createHash("sha256")
-            .update(readFileSync(controllerRunnerBinary))
-            .digest("hex");
-          try {
-            const probe = await remoteCommandRunner.execute({
-              command: "sh",
-              args: [
-                "-c",
-                'test -x "$1" || exit 1; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi',
-                "paperclip-runner-artifact",
-                remoteBinary,
-              ],
-              cwd: remoteTarget.remoteCwd,
-              bypassSession: true,
-              timeoutMs: 10_000,
-            });
-            return probe.exitCode === 0 && !probe.timedOut &&
-              /^[a-f0-9]{64}\s/.test(probe.stdout) &&
-              probe.stdout.trim().split(/\s+/)[0] === expected;
-          } catch {
-            // Missing binaries, checksum tools, or a failed probe use the
-            // ordinary verified staging path; none authorizes cached execution.
-            return false;
-          }
-        },
+        () => matchesControllerRunnerArtifact(remoteBinary),
       );
     }
     const explicitRemoteBinary = input.runnerRemoteBinaryPath?.trim() || null;
@@ -10862,6 +10904,10 @@ async function createRunnerdBackendWithinSessionClaim(
             "runner.artifact.verify_preinstalled",
             () => verifyRemoteRunner(requiredMode, preinstalledRunner),
           );
+          if (existsSync(controllerRunnerBinary) &&
+              !await matchesControllerRunnerArtifact(preinstalledRunner)) {
+            throw new Error("runner_remote_preinstalled_artifact_mismatch");
+          }
           await measureNativeRunnerSpan(
             input.trace,
             "runner.artifact.link",
