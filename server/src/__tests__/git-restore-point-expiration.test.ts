@@ -6,13 +6,15 @@ import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { agents, companies, createDb, executionWorkspaceRestorePoints, executionWorkspaces, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, companies, createDb, executionWorkspaceRestorePoints, executionWorkspaces, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { materializeIsolatedRemoteWorkspaceSource } from "../services/isolated-remote-workspace-source.js";
 import { ensurePersistedExecutionWorkspaceAvailable, realizeExecutionWorkspace } from "../services/workspace-runtime.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { expireReconstructableGitWorkspace, gitWorkspaceLastActivityAt } from "../services/git-workspace-expiration.js";
 import { getStorageService } from "../storage/index.js";
+import { markGitRestorePointExpired } from "../services/git-restore-point-storage.js";
+import { GIT_RESTORE_POINT_EXPIRED_WARNING } from "../services/execution-workspaces.js";
 
 const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.test",
   GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.test", GIT_TERMINAL_PROMPT: "0" };
@@ -54,7 +56,7 @@ describeEmbeddedPostgres("git restore point expiration", () => {
     git(source, "init", "--initial-branch=main");
     await fs.writeFile(path.join(source, "marker.txt"), "commit A\n");
     await fs.writeFile(path.join(source, "remove-me.txt"), "tracked\n");
-    await fs.writeFile(path.join(source, ".gitignore"), "node_modules/\n.env\n.claude/settings.local.json\n");
+    await fs.writeFile(path.join(source, ".gitignore"), "node_modules/\n.env\n.claude/settings.local.json\n*.tsbuildinfo\nevidence/\n");
     git(source, "add", "."); git(source, "commit", "-m", "A");
     git(location, "clone", "--bare", source, remote); git(source, "remote", "add", "origin", remote);
     await db.insert(companies).values({ id: companyId, name: "Restore point fixture", issuePrefix: `RP${companyId.slice(0, 6)}` });
@@ -226,6 +228,36 @@ describeEmbeddedPostgres("git restore point expiration", () => {
     expect(await f.reopen()).toMatchObject({ ok: false, code: "rebuild_failed" });
   });
 
+  it("reopens a workspace whose restore point expired as a fresh workspace with a warning", async () => {
+    const f = await fixture();
+    const unpushed = await makeUnsavedWork(f.cwd);
+    expect(await f.expire()).toMatchObject({ expired: true });
+    const [ledgerRow] = await f.ledger();
+    await markGitRestorePointExpired(db, ledgerRow!);
+    await getStorageService().deleteObject(f.companyId, ledgerRow!.objectKey);
+    const branch = (await f.row()).branchName!;
+    git(f.baseCwd, "worktree", "prune");
+    git(f.baseCwd, "branch", "-D", branch);
+    git(f.baseCwd, "reflog", "expire", "--expire=now", "--all");
+    git(f.baseCwd, "gc", "-q", "--prune=now");
+    expect(() => git(f.baseCwd, "cat-file", "-e", `${unpushed}^{commit}`)).toThrow();
+    expect((await f.row()).metadata?.gitCacheRestoration).toMatchObject({ restorePoint: { expiredAt: expect.any(String) } });
+    await fs.writeFile(f.cwd, "blocks the worktree\n");
+    expect(await f.reopen()).toMatchObject({ ok: false, code: "rebuild_failed" });
+    expect((await f.row()).metadata?.gitCacheRestoration).toMatchObject({ restorePoint: { expiredAt: expect.any(String) } });
+    await fs.rm(f.cwd);
+    const reopened = await f.reopen();
+    expect(reopened).toMatchObject({ ok: true, reopened: true, warning: GIT_RESTORE_POINT_EXPIRED_WARNING });
+    expect(await exists(f.cwd)).toBe(true);
+    expect(git(f.cwd, "rev-parse", "--abbrev-ref", "HEAD")).toBe(branch);
+    expect(git(f.cwd, "rev-parse", "HEAD")).not.toBe(unpushed);
+    expect(git(f.cwd, "status", "--porcelain")).toBe("");
+    await expect(fs.access(path.join(f.cwd, "notes", "todo.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await f.row()).metadata?.gitCacheRestoration).toBeUndefined();
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(comments.filter(comment => comment.body === GIT_RESTORE_POINT_EXPIRED_WARNING)).toMatchObject([{ authorType: "system" }]);
+  });
+
   describe("idle open issues", () => {
     async function openIdle(f: Awaited<ReturnType<typeof fixture>>, idleDays: number) {
       await db.update(issues).set({ status: "in_progress", completedAt: null, updatedAt: new Date(Date.now() - idleDays * DAY_MS) })
@@ -322,6 +354,35 @@ describeEmbeddedPostgres("git restore point expiration", () => {
       expect(await f.expire(idle())).toMatchObject({ expired: false, skipReason: "live_or_unresolved_consumer" });
       expect(await exists(f.cwd)).toBe(true);
     });
+  });
+
+  it("expires a worktree whose only extra files are ignored, and restores them on reopen", async () => {
+    const f = await fixture();
+    await fs.mkdir(path.join(f.cwd, "ui"), { recursive: true });
+    await fs.writeFile(path.join(f.cwd, "ui", "tsconfig.tsbuildinfo"), "{\"version\":\"5\"}\n");
+    await fs.mkdir(path.join(f.cwd, "evidence"));
+    await fs.writeFile(path.join(f.cwd, "evidence", "run.log"), "agent evidence\n");
+    await fs.mkdir(path.join(f.cwd, "node_modules", "pkg"), { recursive: true });
+    await fs.writeFile(path.join(f.cwd, "node_modules", "pkg", "index.js"), "regenerable\n");
+    expect(git(f.cwd, "status", "--porcelain")).toBe("");
+    expect(await f.expire({ restorePoint: undefined })).toMatchObject({ expired: false, skipReason: "unique_ignored_files" });
+    expect(await f.expire()).toMatchObject({ expired: true, restorePoint: true, skipReason: null });
+    expect(await exists(f.cwd)).toBe(false);
+    expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+    expect(await fs.readFile(path.join(f.cwd, "ui", "tsconfig.tsbuildinfo"), "utf8")).toBe("{\"version\":\"5\"}\n");
+    expect(await fs.readFile(path.join(f.cwd, "evidence", "run.log"), "utf8")).toBe("agent evidence\n");
+    expect(await exists(path.join(f.cwd, "node_modules", "pkg", "index.js"))).toBe(false);
+  });
+
+  it("rolls back when an ignored file changes after capture", async () => {
+    const f = await fixture();
+    await fs.mkdir(path.join(f.cwd, "evidence"));
+    await fs.writeFile(path.join(f.cwd, "evidence", "run.log"), "agent evidence\n");
+    const result = await f.expire({ beforeDelete: async () => {
+      await fs.writeFile(path.join(f.cwd, "evidence", "run.log"), "written after capture\n");
+    } });
+    expect(result).toMatchObject({ expired: false, skipReason: "restore_point_contents_changed" });
+    expect(await fs.readFile(path.join(f.cwd, "evidence", "run.log"), "utf8")).toBe("written after capture\n");
   });
 
   it("reports a restore point candidate in dry run without storing anything", async () => {
