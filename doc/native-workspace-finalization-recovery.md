@@ -492,6 +492,9 @@ binding, and chat source fields under the existing nonblocking share lock.
 It excludes saved execution input, runner profiles, and log excerpts. Actual
 retry admission still reads the complete run and its recovery evidence. These
 reads preserve stored run data, source revocation checks, and JSON value types.
+External review-wait discovery selects only chat authorization context fields.
+It keeps the current endpoint, membership, resource, and question-receipt checks;
+saved prompts remain stored and do not cross this discovery query.
 
 Legacy continuation recovery rejects native runs before it loads their saved
 execution input. The persisted disposition check reads only the task binding
@@ -499,3 +502,17 @@ for a native run. It keeps the same task-binding and native-finalization skip
 reasons, including the original nonblank binding values. Native input and history
 stay stored. Real legacy recovery still reads
 its complete context, profile, excerpts, and required failure evidence.
+
+The native Stop continuation recheck reads current run identity, the full Stop
+acknowledgement receipt, and process identity. It does not load saved execution
+input, runner profiles, excerpts, or unrelated result fields. Lease cleanup,
+remote termination receipts, local process checks, task ownership, and admission
+checks keep their existing behavior. Stored runs retain all of their data.
+
+One periodic stranded-message pass coalesces successful native release checks
+for the same company, task, source run, and current source row version. The release
+path already drains that
+task's queue through current admission checks. Each saved request still advances
+its recovery cursor. Rejected attempts, changed source runs, and updated source evidence remain eligible,
+and the next pass checks current state again. Legacy per-request handling stays
+unchanged. Pending work is awaited before a source is marked checked.
