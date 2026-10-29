@@ -50,6 +50,7 @@ import {
   clearIssueExecutionRun,
   removeLiveRunById,
 } from "../lib/optimistic-issue-runs";
+import { useConnectivityStore } from "../lib/connectivity";
 import { queryKeys } from "../lib/queryKeys";
 import { extractCompanyPrefixFromPath, toCompanyRelativePath } from "../lib/company-routes";
 import { useLocation } from "../lib/router";
@@ -1380,6 +1381,30 @@ function invalidateActivityQueries(
   const actorType = readString(payload.actorType);
   const actorId = readString(payload.actorId);
   const details = readRecord(payload.details);
+  const decisionProjectionChanged = entityType === "decision" ||
+    ["inbox.dismissed", "inbox.snoozed", "inbox.restored"].includes(action ?? "") ||
+    action?.startsWith("issue.thread_interaction_") ||
+    action === "issue.status_decision_recorded" ||
+    action === "issue.conversation_session_started" ||
+    (entityType === "issue" && ["issue.created", "issue.updated", "issue.deleted"].includes(action ?? ""));
+  const decisionAudienceChanged = action?.startsWith("issue_access_grant.") ||
+    action?.startsWith("resource_membership.") ||
+    action?.startsWith("company_membership.") ||
+    action?.startsWith("membership.") || action?.includes("privacy");
+  if (decisionAudienceChanged) {
+    // Drop old permission-filtered payloads immediately while the API resolves
+    // the current audience. A failed refetch must not retain a revoked receipt.
+    for (const queryKey of [queryKeys.attention(companyId), ["decisions", companyId, "task-record"], ["issues", "decision-receipts"], ["issues", "chat-handoffs"], ["issues", "pending-questions"]]) {
+      void queryClient.resetQueries({ queryKey });
+    }
+  } else if (decisionProjectionChanged) {
+    queryClient.invalidateQueries({ queryKey: queryKeys.attention(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["decisions", companyId] });
+    queryClient.invalidateQueries({ queryKey: queryKeys.decisionQueues.list(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["issues", "decision-receipts"] });
+    queryClient.invalidateQueries({ queryKey: ["issues", "chat-handoffs"] });
+    queryClient.invalidateQueries({ queryKey: ["issues", "pending-questions"] });
+  }
   const ownActorActivity =
     (actorType === "user" &&
       !!currentActor.userId &&
@@ -2054,6 +2079,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   const hasNeededSocketRecovery = useRef(!visible);
   const { selectedCompanyId, selectedCompany } = useCompany();
   const queryClient = useQueryClient();
+  const connectivity = useConnectivityStore();
   const { pushToast } = useToastActions();
   const location = useLocation();
   const gateRef = useRef<ToastGate>({
@@ -2195,6 +2221,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
         }
         setConnectedScopeKey(socketScopeKey);
         stopPolling();
+        connectivity.reportSocketStatus("open");
         transcripts.open(nextSocket);
         if (reconnectAttempt > 0) {
           gateRef.current.suppressUntil = Date.now() + RECONNECT_SUPPRESS_MS;
@@ -2266,6 +2293,9 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
         transcripts.close();
         if (closed) return;
         setConnectedScopeKey((current) => current === socketScopeKey ? null : current);
+        // A dropped socket may be the first sign of an outage; the store
+        // confirms with a health probe before it changes state.
+        connectivity.reportSocketStatus("closed");
         startPolling();
         scheduleReconnect();
       };
@@ -2296,6 +2326,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
     pushToast,
     canConnectSocket,
     socketAuthKey,
+    connectivity,
     socketScopeKey,
     transcripts,
   ]);
