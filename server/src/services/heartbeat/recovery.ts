@@ -1,4 +1,5 @@
 import { readNativeStartupCleanup, readNativeStartupContext } from "../native-runtime/native-startup-cleanup.js";
+import { legacyWorkspaceRecoveryNotMigrated } from "../legacy-workspace-recovery-migration.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { registerLiveRecoveryWork } from "./live-recovery-work.js";
@@ -962,6 +963,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           inArray(heartbeatRuns.status, ["running", "failed"]),
           isNull(nativeRunFinalizations.resultId),
           eq(nativeRunFinalizations.phase, "retryable_failure"),
+          legacyWorkspaceRecoveryNotMigrated(),
           or(gt(nativeRunFinalizations.nextAttemptAt, now), eq(nativeRunFinalizations.failureCode, NATIVE_RETAINED_OWNER_WAIT)),
         ),
       );
@@ -1860,7 +1862,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   }
 
   async function nativeProcessIsLocal(run: HeartbeatRun) {
-    if (parseObject(run.runnerProfileJson).nativeWorkspaceSync != null) return false;
+    const profile = parseObject(run.runnerProfileJson);
+    if (profile.nativeWorkspaceSync != null || profile.remoteWorkspace != null) return false;
     const [identity] = await db.select({
       eventType: heartbeatRunEvents.eventType,
       agentId: heartbeatRunEvents.agentId,
@@ -2051,6 +2054,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           eq(heartbeatRuns.runtimeMode, "native"),
           eq(nativeRunFinalizations.phase, "retryable_failure"),
           isNull(nativeRunFinalizations.resultId),
+          legacyWorkspaceRecoveryNotMigrated(),
           sql`${heartbeatRuns.contextSnapshot}->'nativeQuestionCancellation' is null`,
         ),
       );
@@ -2065,7 +2069,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!await nativeProcessIsLocal(run)) {
         if (nextAttemptAt && nextAttemptAt > now) continue;
         if (activeRunExecutions.has(run.id) || runningProcesses.has(run.id)) continue;
-        if (parseObject(run.runnerProfileJson).nativeWorkspaceSync != null) {
+        const profile = parseObject(run.runnerProfileJson);
+        if (profile.nativeWorkspaceSync != null || profile.remoteWorkspace != null) {
           remoteRetryRunIds.push(run.id);
         } else {
           const [taskLease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
@@ -2775,7 +2780,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           scope.onDeferredDeadline(Date.now() + 30_000);
           return;
         }
-        await releaseSettledNativeRunProcess(db, scope.runId, scope);
+        const outcome = await releaseSettledNativeRunProcess(db, scope.runId, scope);
+        if (outcome !== "pending") await acknowledgeRemoteStop(scope.runId, scope.companyId);
       },
       orphanLease: scope => sweepOrphanedActiveLeases({ ...scope, backoffMs: 5 * 60_000 }),
       shutdown: scope => sweepLegacyShutdownWorkspaceSettlements(db, new Date(), scope),
