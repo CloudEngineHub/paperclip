@@ -1,4 +1,5 @@
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
+import { isContextCompactionRun } from "../context-compaction.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
 import { resolveCommittedNativeRecoveryNotices } from "./native-recovery-notices.js";
@@ -57,6 +58,7 @@ import type { PrpIgnoredAttentionRequest, PrpTerminalState } from "@paperclipai/
 import {
   arbitrateNativeStatus,
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
+  supersedeStaleOwnerCompletion,
   type NativeAuthoritativeIssueStatus,
 } from "./status-arbiter.js";
 import { recordNativeWorkAssessment } from "./work-assessments.js";
@@ -90,11 +92,13 @@ import {
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
   readAcceptedTaskContinuationSummary,
+  completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
 } from "../heartbeat-run-summary.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
+import { settledResponsePublicationSql } from "./native-response-publication-receipt.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
 import {
   authorizeCommittedChatResponse,
@@ -262,11 +266,23 @@ async function claimCoordinator(input: {
   return claimed;
 }
 
-function terminalFinalizationFailureMessage(failureCode: string, failureScope: "provider" | "workspace" | undefined) {
+/**
+ * A workspace copy-back cause is server-built text in a fixed grammar (see
+ * remoteWorkspaceFailureCause and the native post-result diagnostic). Re-check the shape before it reaches the run:
+ * no paths, no line breaks, bounded length.
+ */
+export function readWorkspaceFailureCause(value: unknown): string | null {
+  return typeof value === "string" && value.length <= 1024
+    && /^(?:remote_workspace|native_post_result)_[a-z_]+(?::[A-Za-z0-9_=;:,.() -]*)?$/.test(value) ? value : null;
+}
+
+function terminalFinalizationFailureMessage(failureCode: string, failureScope: "provider" | "workspace" | undefined,
+  failureCause?: string | null) {
   if (failureCode === "native_workspace_sync_out_retry_exhausted") {
     // This code also covers local-directory and plugin workspaces, so the
     // message stays general and defers to the recovery action's next step.
-    return "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace.";
+    return "Saving the workspace failed after 3 attempts. The agent's result is kept; follow the run's recovery action to repair the workspace."
+      + (failureCause ? ` Last cause: ${failureCause}` : "");
   }
   if (failureCode === "native_workspace_sync_out_unrecoverable") {
     return "The sandbox holding unexported workspace changes is unavailable, so its files could not be saved.";
@@ -289,9 +305,11 @@ async function recordRetryableFailure(input: {
   projectRunStatus?: boolean;
   failureScope?: "provider" | "workspace";
   permanent?: boolean;
+  failureCause?: string | null;
 }) {
   const now = new Date();
   const nextAttemptAt = new Date(now.getTime() + 30_000);
+  const failureCause = readWorkspaceFailureCause(input.failureCause);
   const acceptedRunTerminalState = record(
     input.run.resultJson,
   ).prpRunTerminalState;
@@ -435,6 +453,7 @@ async function recordRetryableFailure(input: {
         failureDetail: {
           message: input.message.slice(0, 2_000),
           originalFailureCode: input.failureCode,
+          ...(failureCause ? { failureCause } : {}),
           ...(priorFailureDetail.workspaceExportRetry ? { workspaceExportRetry: priorFailureDetail.workspaceExportRetry } : {}),
           ...(workspaceFinalizeAttempt === null
             ? {}
@@ -476,7 +495,7 @@ async function recordRetryableFailure(input: {
               ...(terminalRunStatus === "failed"
                 ? explainFailedRun({
                     errorCode: failureCode,
-                    error: terminalFinalizationFailureMessage(failureCode, input.failureScope),
+                    error: terminalFinalizationFailureMessage(failureCode, input.failureScope, failureCause),
                   })
                 : {}),
             }
@@ -489,6 +508,8 @@ async function recordRetryableFailure(input: {
           finalizationPhase: phase,
           failureCode,
           originalFailureCode: input.failureCode,
+          // The latest attempt's redacted cause; cleared when it named none.
+          failureCause,
           nextAttemptAt: supersededByNewerRun || exhausted ? null : nextAttemptAt.toISOString(),
         })}::jsonb`,
         updatedAt: now,
@@ -607,6 +628,7 @@ export async function recordNativeFinalizationFailure(input: {
   projectRunStatus?: boolean;
   failureScope?: "provider" | "workspace";
   permanent?: boolean;
+  failureCause?: string | null;
 }) {
   const [run, coordinator] = await Promise.all([
     input.db
@@ -647,6 +669,7 @@ export async function recordNativeFinalizationFailure(input: {
     projectRunStatus: input.projectRunStatus,
     failureScope: input.failureScope,
     permanent: input.permanent,
+    failureCause: input.failureCause,
   });
 }
 
@@ -998,9 +1021,15 @@ async function recoverCommittedNativeChatResponseInScope(
             sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`,
             sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}' = 'final'`,
           )).orderBy(desc(heartbeatRunEvents.seq)).limit(200);
+        const proposedItemIds = completedPlanProposalIds(await tx.select({ payload: heartbeatRunEvents.payload })
+          .from(heartbeatRunEvents).where(and(
+            eq(heartbeatRunEvents.companyId, input.companyId),
+            eq(heartbeatRunEvents.runId, run.id),
+            eq(heartbeatRunEvents.eventType, "plan.proposed"),
+          )).limit(200));
         const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({
           candidates: rows.flatMap((row) => {
-            const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent });
+            const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent, proposedItemIds });
             return candidate ? [candidate] : [];
           }),
         });
@@ -1016,6 +1045,17 @@ async function recoverCommittedNativeChatResponseInScope(
           existingComment: findHeartbeatRunCompletionComment(comments, run.resultJson),
           finalAgentMessage,
         });
+        if (resolved.decision.commentAction === "reuse" && typeof resolved.decision.commentId === "string") {
+          // The reply is already on the task (for example, the live path wrote
+          // it but did not record its decision). Record it; never post again.
+          await tx.update(heartbeatRuns).set({
+            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+              presentationDecision: { ...resolved.decision,
+                reasonCodes: [...resolved.decision.reasonCodes, "committed_task_response_reused"] },
+            })}::jsonb || ${settledResponsePublicationSql()}`, updatedAt: new Date(),
+          }).where(eq(heartbeatRuns.id, run.id));
+          return false;
+        }
         if (!resolved.text || resolved.decision.commentAction !== "create") return false;
         await notifyChatRunMilestones(tx, input);
         const comment = await issueService(db).addComment(input.issueId, resolved.text,
@@ -1025,7 +1065,7 @@ async function recoverCommittedNativeChatResponseInScope(
           resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
             presentationDecision: { ...resolved.decision, commentId: comment.id,
               reasonCodes: [...resolved.decision.reasonCodes, "committed_task_response_recovered"] },
-          })}::jsonb`, updatedAt: new Date(),
+          })}::jsonb || ${settledResponsePublicationSql()}`, updatedAt: new Date(),
         }).where(eq(heartbeatRuns.id, run.id));
         agentId = run.agentId;
         conversationReply = conversation;
@@ -1504,6 +1544,7 @@ export async function finalizeNativeRun(input: {
       boardResponseWaitOrigin: boardResponseWaitOrigin !== null,
       isConversation: isConversation(authoritativeIssue),
       hasActivePauseHold: pauseHold !== null,
+      contextCompactionRun: isContextCompactionRun(run.contextSnapshot),
       reviewOwnerUserId:
         authoritativeIssue.responsibleUserId ??
         authoritativeIssue.createdByUserId ??
@@ -1519,6 +1560,11 @@ export async function finalizeNativeRun(input: {
     })) {
       proposedDecision = { ...proposedDecision, statusAction: "in_review", toStatus: "in_review",
         reasonCode: "onboarding_first_task_decision_required", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
+    }
+    // A reassigned-away run keeps its accepted result, but cannot close the
+    // new owner's task. The status committer rechecks this under the issue lock.
+    if (!isConversation(authoritativeIssue)) {
+      proposedDecision = supersedeStaleOwnerCompletion(proposedDecision, authoritativeIssue, run.agentId);
     }
     if (proposedDecision.statusAction === "done") {
       const continuation = record(run.contextSnapshot?.executionContinuation);

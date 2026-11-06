@@ -13,9 +13,11 @@ import {
   cleanupRemoteWorkspaceArchive,
   prepareRemoteRepository,
   prepareRemoteWorkspaceDirectory,
+  remoteWorkspaceFailureCause,
   restoreRemoteWorkspaceDirectory,
   type RemoteWorkspaceTarget,
 } from "./remote-workspace-transport.js";
+import { classifyNativeWorkspaceFailure } from "./native-runtime/native-workspace-failure.js";
 
 const exec = promisify(execFile);
 
@@ -237,6 +239,73 @@ describe("remote workspace transport safety with real sandbox commands", () => {
       await cleanupRemoteWorkspaceArchive({ target: remote, remoteCwd: retried.stagingRoot, operationId: retried.operationId });
       expect(await fs.readFile(path.join(root, "later.txt"), "utf8")).toBe("keep later work\n");
     } finally { await captured.cleanup(); }
+  });
+
+  it("names the restore step that refused an occupied folder without touching its files", async () => {
+    await fs.writeFile(path.join(workspace, "saved.txt"), "saved synthetic work\n");
+    const { remote } = target();
+    const captured = await captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() });
+    try {
+      const root = path.join(scratch, "occupied-secret-folder");
+      await fs.mkdir(root); await fs.writeFile(path.join(root, "later.txt"), "unsaved later work\n");
+      const failure = await restoreRemoteWorkspaceDirectory({ target: remote, remoteCwd: root, archivePath: captured.archivePath,
+        manifestDigest: captured.manifestDigest, restorationIdentity: "e".repeat(64) }).then(() => null, (error: unknown) => error as Error);
+      if (!failure) throw new Error("restore unexpectedly succeeded");
+      expect(failure.message).toBe("remote_workspace_operation_failed: operation=restore exit=1; "
+        + "remote_workspace_restore_failed: stage=inspect_root reason=occupied_root");
+      expect(remoteWorkspaceFailureCause(failure)).toBe(failure.message);
+      expect(await fs.readdir(root)).toEqual(["later.txt"]);
+    } finally { await captured.cleanup(); }
+  });
+
+  it("names a rejected archive during restore by its closed archive reason", async () => {
+    await fs.writeFile(path.join(workspace, "saved.txt"), "saved synthetic work\n");
+    const { remote } = target();
+    const captured = await captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() });
+    try {
+      const root = path.join(scratch, "restored-with-wrong-digest");
+      await expect(restoreRemoteWorkspaceDirectory({ target: remote, remoteCwd: root, archivePath: captured.archivePath,
+        manifestDigest: "f".repeat(64), restorationIdentity: "e".repeat(64) }))
+        .rejects.toThrow(/^remote_workspace_operation_failed: operation=restore exit=1; remote_workspace_restore_failed: stage=extract archive=manifest_mismatch exit=1$/);
+      expect(await fs.lstat(root).catch(() => null)).toBeNull();
+    } finally { await captured.cleanup(); }
+  });
+
+  it("names the preparation step that could not select a missing branch", async () => {
+    const origin = await repository(), { remote } = target(), root = path.join(workspace, "missing-branch-cause");
+    await expect(prepareRemoteWorkspaceDirectory({ target: remote, remoteCwd: root,
+      preparationIdentity: createHash("sha256").update("synthetic-missing-branch-cause").digest("hex"),
+      source: { kind: "git", repoUrl: origin, ref: "main", branchName: "feature/missing", branchMode: "existing" },
+      resolveGitAuth: async () => null }))
+      .rejects.toThrow(/^remote_workspace_operation_failed: operation=prepare exit=1; remote_workspace_prepare_failed: stage=checkout_branch exit=1 program=git$/);
+  });
+
+  it("names the repository step that found a changed origin", async () => {
+    const origin = await repository(), { remote } = target(), root = path.join(workspace, "repos", "changed-origin");
+    await prepareRemoteRepository({ target: remote, remoteCwd: root, repoUrl: origin, ref: "HEAD", resolveGitAuth: async () => null });
+    await expect(prepareRemoteRepository({ target: remote, remoteCwd: root, repoUrl: `${origin}-moved`, ref: "HEAD",
+      resolveGitAuth: async () => null }))
+      .rejects.toThrow(/^remote_workspace_operation_failed: operation=repository exit=1; remote_workspace_repository_failed: stage=verify_origin reason=repository_origin_changed$/);
+  });
+
+  it.each(["prepare", "repository", "restore"] as const)("drops %s output that is outside the closed cause grammar", async operation => {
+    const { remote, execute } = target();
+    const forged = `remote_workspace_${operation}_failed: stage=extract reason=/home/secret`;
+    if (operation === "restore") execute.mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "", timedOut: false,
+      signal: null, pid: process.pid, startedAt: new Date().toISOString() });
+    execute.mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: forged, timedOut: false,
+      signal: null, pid: process.pid, startedAt: new Date().toISOString() });
+    const request = operation === "prepare"
+      ? prepareRemoteWorkspaceDirectory({ target: remote, remoteCwd: workspace, source: { kind: "empty" },
+        preparationIdentity: "a".repeat(64), resolveGitAuth: async () => null })
+      : operation === "repository"
+        ? prepareRemoteRepository({ target: remote, remoteCwd: workspace, repoUrl: "https://example.invalid/fixture.git", ref: null, resolveGitAuth: async () => null })
+        : (async () => {
+          const archivePath = path.join(scratch, "forged.pcws"); await fs.writeFile(archivePath, "synthetic archive");
+          return restoreRemoteWorkspaceDirectory({ target: remote, remoteCwd: path.join(scratch, "forged"), archivePath,
+            manifestDigest: "a".repeat(64), restorationIdentity: "b".repeat(64) });
+        })();
+    await expect(request).rejects.toThrow(new RegExp(`^remote_workspace_operation_failed: operation=${operation} exit=1$`));
   });
 
   it("publishes one complete capture pair when the same operation starts simultaneously", async () => {
@@ -533,6 +602,61 @@ describe("remote workspace transport safety with real sandbox commands", () => {
       pid: process.pid, startedAt: new Date().toISOString() });
     await expect(captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() }))
       .rejects.toThrow(/^remote_workspace_operation_failed: operation=archive_helper signal=SIGKILL$/);
+  });
+
+  it.each([
+    ["Daytona sandbox lease SYNTHETIC-sandbox-id is no longer active.", undefined, "transport=sandbox_lease_inactive"],
+    ["daytona_sandbox_not_found: /home/SYNTHETIC/private", undefined, "transport=daytona_sandbox_not_found"],
+    ["connect to /SYNTHETIC/private failed", "ECONNRESET", "transport=transport_closed code=ECONNRESET"],
+    ["SYNTHETIC_PRIVATE provider response", undefined, "transport=provider_error"],
+  ])("names a copy-back command the provider refused without its text: %j", async (message, code, named) => {
+    const { remote, execute } = target();
+    execute.mockRejectedValueOnce(Object.assign(new Error(message), code ? { code } : {}));
+    const failure = await captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() })
+      .then(() => null, (error: unknown) => error as Error);
+    // The thrown error is unchanged for existing callers; only the recorded cause is redacted.
+    expect(failure?.message).toBe(message);
+    expect(remoteWorkspaceFailureCause(failure)).toBe(`remote_workspace_operation_failed: operation=archive_helper ${named}`);
+    expect(remoteWorkspaceFailureCause(failure)).not.toMatch(/SYNTHETIC|private/);
+    // The sandbox-loss classification that stops retries still sees its code.
+    expect(classifyNativeWorkspaceFailure(failure).code).toBe(message.startsWith("daytona_sandbox_not_found")
+      ? "workspace_sync_out_unrecoverable" : "workspace_sync_out_failed");
+  });
+
+  it("names a failed archive download without the provider text", async () => {
+    await fs.writeFile(path.join(workspace, "saved.txt"), "saved synthetic bytes\n");
+    const { remote } = target();
+    remote.runner!.syncOut = vi.fn(async () => { throw new Error("Daytona download of /SYNTHETIC/private timed out"); });
+    const failure = await captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() })
+      .then(() => null, (error: unknown) => error as Error);
+    expect(remoteWorkspaceFailureCause(failure)).toBe("remote_workspace_operation_failed: operation=download transport=transport_timeout");
+  });
+
+  it("names a permission-denied archive download without its path", async () => {
+    await fs.writeFile(path.join(workspace, "saved.txt"), "saved synthetic bytes\n");
+    const { remote } = target();
+    remote.runner!.syncOut = vi.fn(async () => {
+      throw Object.assign(new Error("EACCES: permission denied, open '/SYNTHETIC/private'"), { code: "EACCES" });
+    });
+    const failure = await captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() })
+      .then(() => null, (error: unknown) => error as Error);
+    expect(remoteWorkspaceFailureCause(failure))
+      .toBe("remote_workspace_operation_failed: operation=download transport=permission_denied code=EACCES");
+  });
+
+  it("keeps an archive-safety refusal exact for its own retry policy", async () => {
+    await fs.writeFile(path.join(workspace, "saved.txt"), "saved synthetic bytes\n");
+    const { remote } = target();
+    const refusal = "Daytona syncOut refusing tarball member that escapes the extraction dir: ../private";
+    remote.runner!.syncOut = vi.fn(async () => { throw new Error(refusal); });
+    const failure = await captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() })
+      .then(() => null, (error: unknown) => error as Error);
+    expect(failure?.message).toBe(refusal);
+    expect(remoteWorkspaceFailureCause(failure)).toBeNull();
+  });
+
+  it("does not label a provider error that did not come from a copy-back command", () => {
+    expect(remoteWorkspaceFailureCause(new Error("Daytona sandbox lease SYNTHETIC is no longer active."))).toBeNull();
   });
 
   it.each([
