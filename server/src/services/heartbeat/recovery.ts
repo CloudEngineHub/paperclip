@@ -1,4 +1,4 @@
-import { releaseDeadControllerResultLeases } from "../native-runtime/native-dead-controller-result-lease.js";
+import { settleOwnableKind } from "../recovery/ownership-invariant-report.js";
 import { readNativeStartupCleanup, readNativeStartupContext } from "../native-runtime/native-startup-cleanup.js";
 import { legacyWorkspaceRecoveryNotMigrated } from "../legacy-workspace-recovery-migration.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
@@ -28,6 +28,7 @@ import {
 } from "../sandbox-stop-and-retain.js";
 import { discoverSettledNativeRunProcesses, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, recordNativeLocalProcessStopInTransaction, releaseSettledNativeRunProcess, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
+import { retireInheritedRemoteRunnerIdentity } from "../native-runtime/native-inherited-runner-retry.js";
 import {
   legacyControllerBootId,
   liveLegacyControllerExpiresAt,
@@ -108,7 +109,7 @@ import type { environmentService } from "../environments.js";
 import type { environmentRuntimeService, ProviderResourceDisposition } from "../environment-runtime.js";
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import type { createHeartbeatRunState } from "./run-state.js";
-import type { HeartbeatRetryDependencies, createHeartbeatRetries } from "./retries.js";
+import { failedRunRetryBudgetSpent, type HeartbeatRetryDependencies, type createHeartbeatRetries } from "./retries.js";
 import type { CancelRunOptions } from "./run-control.js";
 import { requestRestartInterruptedTurnRetry } from "./restart-interrupted-turn.js";
 
@@ -940,11 +941,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
   async function recoverNativeRunsAfterRestart(now = new Date(), runIds?: string[], options?: { skipDelegatedWork?: boolean; trigger?: "same_run_retry" }) {
     // A hard kill cannot release its accepted results the way a graceful drain
-    // does. Release leases whose earlier-boot controller has exited, so the
-    // finalization below settles them now instead of after lease expiry.
-    const releasedResults = await releaseDeadControllerResultLeases(db, { now, runIds,
-      liveRunExecutions: activeRunExecutions });
+    // does. The shared ownership path settles each lease whose controller is
+    // proven gone, so the finalization below settles it now instead of after
+    // lease expiry. The periodic reconciler pass covers any it misses.
+    const releasedResults = await settleOwnableKind(db, "native_accepted_result_lease", { now, runIds,
+      skipRunIds: activeRunExecutions });
     for (const released of releasedResults) {
+      if (!released.runId) continue;
       const run = await getRun(released.runId).catch(() => null);
       if (run) await appendRunEvent(run, { eventType: "native.recovery.transition", stream: "system", level: "info",
         message: "Server restart released the accepted native result of a stopped controller for finalization",
@@ -1463,13 +1466,26 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         const controller = readControllerProcess(saved);
         const attemptId = saved?.attemptId;
         if (!controller || typeof attemptId !== "string" || !await controllerProcessExited(controller)) continue;
+        // A dead server is not a failed teardown. A sweep claim already counted
+        // its attempt, so give it back; claims from other paths never counted.
+        // The update is single-use: it matches only while the fence is still in
+        // the future and it consumes `countedAttempt`, so an overlapping sweep
+        // that read the same claim cannot refund the attempt again.
+        const returnAttempt = saved?.countedAttempt === true;
         await db.update(environmentLeases)
-          .set({ metadata: sql`jsonb_set(${pendingCleanupMetadataObjectSql()}, '{pendingCleanupLeaseExpiresAtMs}', to_jsonb(${nowMs}::bigint))` })
+          .set({ metadata: sql`jsonb_set(jsonb_set(jsonb_set(${pendingCleanupMetadataObjectSql()},
+            '{pendingCleanupLeaseExpiresAtMs}', to_jsonb(${nowMs}::bigint)),
+            array[${PENDING_CLEANUP_ATTEMPTS_METADATA_KEY}],
+            to_jsonb(greatest(${pendingCleanupAttemptsSql()} - ${returnAttempt ? 1 : 0}, 0)::int), true),
+            '{pendingCleanupController,countedAttempt}', 'false'::jsonb, true)` })
           .where(and(
             eq(environmentLeases.id, row.id),
             eq(environmentLeases.status, "pending_cleanup"),
+            sql`${environmentLeases.metadata}->>'pendingCleanupInFlight' = 'true'`,
+            sql`(${environmentLeases.metadata}->>'pendingCleanupLeaseExpiresAtMs')::numeric > ${nowMs}`,
             sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${attemptId}`,
             sql`${environmentLeases.metadata}->'pendingCleanupController'->>'attemptId' = ${attemptId}`,
+            sql`coalesce(${environmentLeases.metadata}->'pendingCleanupController'->>'countedAttempt', 'false') = ${returnAttempt ? "true" : "false"}`,
           ));
       }
       if (claimed.length < PENDING_CLEANUP_SWEEP_PAGE_SIZE) return;
@@ -1503,7 +1519,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         metadata: sql`jsonb_set(${pendingCleanupMetadataObjectSql()}, array[${PENDING_CLEANUP_ATTEMPTS_METADATA_KEY}], to_jsonb(${expectedAttempts + 1}::int), true)
           || ${JSON.stringify({ ...(manualAttempt ? { pendingCleanupManualAttemptId: randomUUID() } : {}),
             pendingCleanupAttemptId: attemptId, pendingCleanupInFlight: true,
-            pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000, pendingCleanupController: { ...controller, attemptId },
+            pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000,
+            pendingCleanupController: { ...controller, attemptId, countedAttempt: true },
           })}::jsonb`,
         lastUsedAt: now,
         updatedAt: now,
@@ -2188,7 +2205,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         if (activeRunExecutions.has(run.id) || runningProcesses.has(run.id)) continue;
         const profile = parseObject(run.runnerProfileJson);
         if (profile.nativeWorkspaceSync != null || profile.remoteWorkspace != null) {
-          remoteRetryRunIds.push(run.id);
+          // A continuation that never started its own runner holds only its
+          // predecessor's identity: resume it the way its failed attempt ran.
+          const retirement = await retireInheritedRemoteRunnerIdentity(db, run.id);
+          if (retirement === "retired") claimableNativeRunIds.add(run.id);
+          // A lock or database error is not evidence: retry on the next sweep.
+          else if (retirement === "transient") scope.onDeferredDeadline?.(Date.now() + 30_000);
+          else remoteRetryRunIds.push(run.id);
         } else {
           const [taskLease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
             eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
@@ -2658,7 +2681,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         !revokedState.processGroupId;
       const shouldRetry =
         !await pendingCaseHandoffForRun(db, run.id, run.companyId) &&
-        (run.processLossRetryCount ?? 0) < 1 &&
+        // Process loss spends the durable failure retry budget that
+        // enqueueProcessLossRetry schedules against (execution-semantics
+        // "Shutdown, process loss, and provider failure"). Checking it here
+        // keeps "retrying once" honest and lets an exhausted chain fall
+        // through to the interaction continuation path below.
+        !failedRunRetryBudgetSpent(run) &&
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
           restartInterruptedBeforeDispatch ||
