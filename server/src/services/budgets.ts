@@ -1,4 +1,5 @@
 import { notifyMuseContactVerification } from "../modules/external-agents/index.js";
+import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
 import { notifyRunDispatch } from "./run-dispatch-notifications.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
@@ -348,7 +349,7 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     const now = new Date();
     if (policy.scopeType === "agent") {
       const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
-      await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, true);
+      await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, true, publications);
       return;
     }
 
@@ -415,9 +416,11 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     ));
     const observations = await computeObservedSpends(db, policies, now);
     if (policies.some((candidate, index) => hardStopReached(candidate, observations[index]))) return;
+    // Lifting a budget pause is a hold-release event for deferred work intents.
+    await promoteDeferredWorkIntents(db, { companyId: policy.companyId, trigger: "pause_lifted" });
     if (policy.scopeType === "agent") {
       const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
-      await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, false);
+      await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, false, publications);
       return;
     }
 

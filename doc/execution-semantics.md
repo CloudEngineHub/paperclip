@@ -512,6 +512,8 @@ Repeated automatic signals for an unchanged gate share one durable skipped-wake 
 
 Another run's unfinished accounting or cleanup never refuses new work (see `doc/SPEC-implementation.md`, "Admission is independent of cleanup and accounting"). A new task whose first assignment wake is refused by a temporary condition (an explicit pause) stays `todo`. Stranded-work recovery does not move a task with no run to `blocked` for such a condition. The task shows what it waits for, and the assigned-task liveness sweep admits it once the condition clears, through normal admission and with one run. A reached hard stop or blocked unpriced usage remains a board decision. Removed assignees and cancelled tasks still do not wake.
 
+A user's message refused by a pause (a paused agent, a paused company, or a budget pause that is not a reached hard stop) is saved as a deferred intent that names the refusal and its release trigger; it is never written as a terminal skip. The pause's own stop keeps it. Lifting the pause is the operator's explicit authorization to send what the pause refused, as Send is after a Stop: when the pause stopped the task's run, the lifted pause issues the task's next explicit wake, which adopts the saved message once. A task that never ran keeps the message in the task, and stranded-work recovery starts it.
+
 The same holds for accepted work beyond a first assignment. A temporary refusal never terminally cancels or escalates accepted work: an unstarted queued run (a promoted comment, a Retry, or a recovery) stays queued, and stranded-work recovery leaves the task as it is instead of moving it to `blocked`. These waits are passive, so settling a run's accounting wakes queued-run dispatch, the saved-receipt worker, and stranded-work recovery for the company. The held work then starts through normal admission, once. When a native run reaches a terminal status through recovery, or releases its environment, each message saved behind it is hinted by its own receipt, so delivery does not wait out a company-wide rescan interval.
 
 New comments received during an execution hold retain their individual deferred receipts and ordered comment ids. Release cannot drain those receipts while replay remains blocked; the next eligible wake can adopt them. Authorized external-chat requests also remain deferred with their exact durable receipt. They must use normal promotion and current authorization; a generic wake cannot adopt only their comment ids and discard their actor or session contract. A wait does not authorize replay, reset an incident retry budget, or bypass an interaction's delivery rules.
@@ -1445,7 +1447,11 @@ authorize an empty replacement or replay completed work.
 Read-only imports can use a superseded immutable snapshot with the exact saved
 operation receipt. They do not establish current workspace execution authority.
 Restored sidecars keep user edits, and only paths present with their recorded
-provenance in the current prepared root are published to the provider. Older
+provenance in the current prepared root are published to the provider.
+A remote sidecar records the run it was last shown to. Once that run
+succeeds, the next preparation removes the sidecar from the workspace and
+keeps only a retired record, so later saves stop carrying it and it is never
+attached or shown again. The source run's own saved snapshot is unaffected. Older
 attachment records rebuild this proof from saved receipts; reusing a live
 allocation never replaces their files. For a related task, retention requires
 the selected workspace’s committed migration history and matching source marker,
@@ -1870,6 +1876,71 @@ a board recovery action to confirm that the previous server stopped. Its run
 processes with no recorded host are left to the run's Stop control. The next
 release removes the fallback and treats every row with no recorded host as
 unprovable.
+
+A server boot that holds work keeps a controller instance lease
+(`controller_instances`): a row named by its boot id, with an epoch and a lease
+on the database clock (90 s TTL).
+
+- **Renewal.** The shared delivery-work coordinator schedules it every 30 s,
+  only while the boot holds work. A single upsert both creates the row on first
+  use and extends the lease, but only if the boot stamped ownership in the last
+  90 s or still has an in-progress record stamped with its boot id: an
+  environment lease or cleanup claim, a sandbox creation intent, a workspace
+  finalize attempt, an agent lifecycle step, a native finalizer or cleanup
+  lease, an open native coordinator claim, or a running legacy run. A stamp
+  whose ownership write may still be pending also counts until the server's
+  tracked work settles (at most 10 minutes). Otherwise the lease lapses and
+  the worker issues no statements until the next stamp, so an idle server's
+  database can sleep.
+- **Renewal failure.** Each renewal has a 10 s bound. A failed or timed-out
+  renewal quiesces the boot: it reports a task drain and dispatches no new work.
+  If it renews again before anyone fences it, it resumes. It exits only if
+  renewal has kept failing for 60 s, counted from the first failed attempt's
+  start, while it still holds work.
+
+A record owned by the server process itself (a lease, claim or intent with no
+recorded process group) that names a boot in another host or PID space is
+judged through that boot's row:
+
+- `stopped`: the boot shut down cleanly, so the record's owner is gone.
+- live lease: the owner is alive.
+- otherwise, the boot's last sign of life is the later of its lease expiry and
+  the record's last write plus the TTL. A boot that resumes after an idle lapse
+  renews on its first stamp.
+  - Within 30 s after that, the owner still counts as alive, so the settle watch
+    re-checks it.
+  - After that, the prover fences the boot (only a newer epoch may), and the
+    owner is gone. A boot that held work has exited by then.
+- no row (a boot from before the lease): the record stays unprovable.
+
+A record with a recorded process group stays unprovable across hosts, because
+agent processes may outlive their server. The lease is off on a Railway
+deployment with an exclusive volume, which proves a replaced deployment from its
+own identity. A stateless Railway service keeps it.
+`PAPERCLIP_CONTROLLER_INSTANCE_LEASE=on|off` overrides this.
+
+A record saved before its owner was fully recorded (`no_owner_stamp`,
+`missing_identity`, `process_space_unrecorded`) stays unprovable and is never
+released on its own. For a settling kind that opts in, recovery asks the board
+on the record's task (`ownership_owner_unprovable`) to confirm that the previous
+server stopped. The board action (`POST /api/issues/{id}/recovery-actions/confirm-owner-gone`)
+is board-only, needs `runtime:confirm_owner_stop`, writes an
+`issue.ownership_owner_gone_confirmed` activity entry and wakes the reconciler.
+The confirmation then proves the owner gone (`operator_attested`) and the kind's
+own compare-and-swap settle releases the record:
+
+- The environment run lease stores the confirmation on the lease.
+- Every other opted-in kind (legacy controller lease, teardown claim, sandbox
+  creation intent, runtime-control operation, workspace finalize attempt,
+  native finalizer and cleanup leases) keeps it on the resolved recovery action,
+  bound to the record's last write. It applies only while the record is
+  unchanged and its recorded process is still unprovable for that legacy reason
+  (`missing_identity`, `process_space_unrecorded`). A record that changed since
+  is judged again, and recovery asks again about its current version. These
+  settles compare-and-swap on the recorded process, so a record of these kinds
+  with no owner stamp at all keeps its existing recovery path and is not offered.
+- Kinds that are unowned by design, such as queued pending cleanup and
+  accounting debt, are never offered.
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output.
 
