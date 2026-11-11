@@ -78,6 +78,7 @@ const apiPrefixes: Record<string, string> = {
   "issues.ts": "/api",
   "issue-tree-control.ts": "/api",
   "llms.ts": "/api",
+  "link-previews.ts": "/api",
   "managed-agent-profiles.ts": "/api",
   "onboarding-seed.ts": "/api",
   "openapi.ts": "/api",
@@ -1300,6 +1301,17 @@ describe("openapi routes", () => {
     expect(spec.paths[base + "/event-test"].post.requestBody.content["application/json"].schema.properties.bindingId).toMatchObject({ type: "string", format: "uuid" });
   });
 
+  it("documents project environment compatibility and creation selection", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/companies/{companyId}/project-environments"].get;
+    expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    expect(operation.responses["403"]).toBeDefined();
+    expect(operation.responses["200"].content["application/json"].schema.properties).toHaveProperty("defaultEnvironmentId");
+    const creation = spec.paths["/api/companies/{companyId}/projects"].post;
+    expect(creation.requestBody.content["application/json"].schema.properties.environmentId).toMatchObject({ type: "string", format: "uuid" });
+    expect(creation.requestBody.content["application/json"].schema.properties.expectedStorageProviderPluginId).toMatchObject({ type: "string", nullable: true });
+  });
+
   it("documents board-only repository discovery and selection", () => {
     const { spec } = loadSpecRoutes();
     const discovery = spec.paths["/api/companies/{companyId}/project-repositories"].get;
@@ -1508,6 +1520,10 @@ describe("openapi routes", () => {
     expect(
       (responseSchemas.start.properties as Record<string, unknown>).prompt,
     ).toBeDefined();
+    const activeSchema = spec.paths[`${base}/active`].get.responses["200"].content["application/json"].schema;
+    expect(activeSchema.properties.agentId).toMatchObject({ type: "string", format: "uuid" });
+    expect(activeSchema.required ?? []).not.toContain("agentId");
+    expect((responseSchemas.status.properties as Record<string, unknown>).agentId).toBeUndefined();
     // The prompt route returns the authorization URL and the optional transport
     // advisory. The advisory is present on a non-confidential transport, so the
     // client can show a non-blocking disclaimer.

@@ -427,10 +427,17 @@ export function environmentRoutes(
   }
 
   function presentEnvironmentForRead<T extends {
+    driver: string;
     config: Record<string, unknown> | null;
     envVars?: Record<string, unknown> | null;
     metadata: Record<string, unknown> | null;
   }>(req: Request, environment: T): T {
+    if (environment.driver === "plugin") {
+      const { pluginKey, driverKey } = environment.config ?? {};
+      if (typeof pluginKey === "string" && typeof driverKey === "string") {
+        environment = { ...environment, pluginDriver: { pluginKey, driverKey } };
+      }
+    }
     if (environment.metadata) {
       const { [SANDBOX_PLATFORM_PROBE_METADATA_KEY]: _probe, ...metadata } = environment.metadata;
       environment = { ...environment, metadata };
@@ -770,7 +777,8 @@ export function environmentRoutes(
       workerManager: options.pluginWorkerManager,
       recoverMissingWorker: options.recoverMissingPluginWorker,
     });
-    res.json(getEnvironmentCapabilities(
+    const loginDrivers = await listReadyPluginEnvironmentDrivers({ db, workerManager: options.pluginWorkerManager, kind: "environment_driver" });
+    const capabilities = getEnvironmentCapabilities(
       AGENT_ADAPTER_TYPES,
       {
         sandboxProviders: Object.fromEntries(pluginDrivers.map((driver) => [
@@ -809,7 +817,10 @@ export function environmentRoutes(
           },
         ])),
       },
-    ));
+    );
+    res.json({ ...capabilities, loginPtyDrivers: Object.fromEntries(loginDrivers.map(driver => [
+      `${driver.pluginKey}:${driver.driverKey}`, { supportsLoginPty: driver.supportsLoginPty === true, supportsCodexLogin: driver.supportsCodexLogin === true },
+    ])) });
   });
 
   router.get("/environments/:environmentId/custom-image-template", async (req, res) => {
