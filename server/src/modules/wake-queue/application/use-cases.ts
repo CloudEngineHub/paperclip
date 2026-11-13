@@ -363,15 +363,25 @@ async function promoteDeferredWake(
       finishingRunId: run.id,
       commentIds: workingCandidate.deferredCommentIds,
     });
+    const agentFeedbackAfterCompletion =
+      currentIssue.status === "done" &&
+      workingCandidate.agentId === currentIssue.assigneeAgentId &&
+      workingCandidate.requestedByActorType === "agent" &&
+      workingCandidate.deferredContextSeed.resumeIntent === true &&
+      workingCandidate.queuedCommentIds.length > 0;
     shouldReopen =
       !selfAuthorship.allSelfAuthored &&
       (workingCandidate.requestedByActorType === "user" ||
         workingCandidate.wakeReason === "issue_reopened_via_comment" ||
-        (currentIssue.status === "done" &&
-          workingCandidate.agentId === currentIssue.assigneeAgentId &&
-          workingCandidate.requestedByActorType === "agent" &&
-          workingCandidate.deferredContextSeed.resumeIntent === true &&
-          workingCandidate.queuedCommentIds.length > 0));
+        // The agent watching the task posted it while the run that closed the
+        // task was active. That agent receives the completed result and can
+        // follow up from it; reopening would only repeat finished work. A
+        // person's message (handled above) always reopens.
+        (agentFeedbackAfterCompletion && run.agentId === currentIssue.assigneeAgentId &&
+          !await ports.transaction.isWatcherCommentDuringFinishingRun({
+            companyId: run.companyId, issueId: currentIssue.id, finishingRunId: run.id,
+            commentIds: workingCandidate.queuedCommentIds,
+          })));
   }
 
   // A person's answer saved while the task was still open is owed input. The
@@ -894,7 +904,8 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       isSameExecutionAgent,
       shouldDeferFollowupWake,
       shouldQueueFollowupForRunningWake,
-      availableActiveExecutionRunPresent: availableActiveExecutionRun !== null,
+      availableActiveExecutionRunPresent: availableActiveExecutionRun !== null || (shouldDeferFollowupWake &&
+        isSameExecutionAgent && input.activeExecutionRun.status === "running" && Boolean(input.wakeCommentId)),
     });
 
     if (decision.kind === "proceed") return { kind: "proceed" };
